@@ -1,13 +1,10 @@
 """
-Agent Scanner — parcourt tout l'univers boursier et calcule les signaux CPA.
-
-Gère la parallélisation, le cache, et les erreurs par action.
+Agent Scanner — CPA + ML Ensemble + Détection d'opportunités.
 """
 import logging
-import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from datetime import datetime
 
 import numpy as np
@@ -16,28 +13,19 @@ import pandas as pd
 from src.data.universe import get_universe
 from src.data.fetcher import fetch_prices, fetch_fundamentals, fetch_fama_french_factors
 from src.models.cpa import CPACalculator, CPAResult
+from src.models.opportunity_detector import OpportunityDetector, Opportunity
 from config.settings import (
     DATA_PERIOD, TOP_N_SIGNALS, ALPHA_THRESHOLD,
     W1, W2, W3, W4, LAMBDA_RISK, RISK_FREE_RATE, KELLY_FRACTION,
 )
 
 logger = logging.getLogger(__name__)
-
-MAX_WORKERS = 8          # threads parallèles
-BATCH_SIZE = 20          # tickers par batch pour yfinance
+MAX_WORKERS = 6
+BATCH_SIZE = 20
 
 
 class ScannerAgent:
-    """
-    Agent principal de scan.
-
-    Workflow:
-    1. Charge l'univers de tickers
-    2. Télécharge les prix en batch
-    3. Télécharge les fondamentaux en parallèle
-    4. Calcule le CPA pour chaque titre
-    5. Retourne le classement trié par alpha
-    """
+    """Scanner avec pipeline ML intégré."""
 
     def __init__(self, universe: str = "SP500"):
         self.universe = universe
@@ -47,55 +35,54 @@ class ScannerAgent:
             risk_free=RISK_FREE_RATE,
             kelly_fraction=KELLY_FRACTION,
         )
+        self.detector = OpportunityDetector()
         self.ff_factors: Optional[pd.DataFrame] = None
         self.results: List[CPAResult] = []
+        self.opportunities: List[Opportunity] = []
 
     def run(self, max_tickers: Optional[int] = None) -> List[CPAResult]:
-        """Lance le scan complet de l'univers."""
-        start_time = datetime.now()
-        logger.info(f"[ScannerAgent] Démarrage scan {self.universe}")
+        start = datetime.now()
+        logger.info(f"[ScannerAgent] Démarrage {self.universe}")
 
-        # 1. Univers
         tickers = get_universe(self.universe)
         if max_tickers:
             tickers = tickers[:max_tickers]
-        logger.info(f"[ScannerAgent] {len(tickers)} tickers à analyser")
+        logger.info(f"[ScannerAgent] {len(tickers)} tickers")
 
-        # 2. Facteurs Fama-French
-        logger.info("[ScannerAgent] Chargement facteurs FF5+MOM...")
         self.ff_factors = fetch_fama_french_factors()
-
-        # 3. Prix en batch
-        logger.info("[ScannerAgent] Téléchargement des prix...")
         all_prices = self._fetch_prices_batched(tickers)
-
-        # 4. Benchmark (SPY ou MSCI pour Eurostoxx)
         benchmark = self._get_benchmark()
 
-        # 5. Analyse en parallèle
-        logger.info("[ScannerAgent] Calcul CPA en parallèle...")
-        self.results = self._analyze_parallel(tickers, all_prices, benchmark)
+        logger.info("[ScannerAgent] Pipeline CPA + ML en parallèle...")
+        self.results, self.opportunities = self._analyze_parallel(
+            tickers, all_prices, benchmark
+        )
 
-        # 6. Tri
         self.results.sort(key=lambda r: r.alpha, reverse=True)
+        self.opportunities.sort(key=lambda o: o.score, reverse=True)
 
-        elapsed = (datetime.now() - start_time).seconds
+        elapsed = (datetime.now() - start).seconds
         logger.info(
-            f"[ScannerAgent] Terminé en {elapsed}s — "
-            f"{len(self.results)} résultats"
+            f"[ScannerAgent] {elapsed}s — "
+            f"{len(self.results)} CPA / {len(self.opportunities)} opportunités"
         )
         return self.results
 
-    def top_signals(self, n: int = TOP_N_SIGNALS, threshold: float = ALPHA_THRESHOLD) -> List[CPAResult]:
-        """Retourne les N meilleurs signaux au-dessus du seuil."""
+    def top_signals(self, n: int = TOP_N_SIGNALS, threshold: float = ALPHA_THRESHOLD):
         return [r for r in self.results if r.alpha >= threshold][:n]
 
-    def bottom_signals(self, n: int = 10) -> List[CPAResult]:
-        """Retourne les N pires signaux (vente/éviter)."""
-        return sorted(self.results, key=lambda r: r.alpha)[:n]
+    def top_opportunities(self, n: int = 10) -> List[Opportunity]:
+        """Meilleures opportunités (acheter) — tri descendant par score."""
+        return sorted(
+            [o for o in self.opportunities if o.score > 0.10],
+            key=lambda o: o.score, reverse=True,
+        )[:n]
+
+    def all_universe_opportunities(self) -> List[Opportunity]:
+        """Toutes les opportunités positives + négatives triées."""
+        return sorted(self.opportunities, key=lambda o: o.score, reverse=True)
 
     def _fetch_prices_batched(self, tickers: List[str]) -> Dict[str, pd.Series]:
-        """Télécharge les prix par batch pour éviter les timeouts."""
         all_prices = {}
         for i in range(0, len(tickers), BATCH_SIZE):
             batch = tickers[i:i + BATCH_SIZE]
@@ -107,23 +94,20 @@ class ScannerAgent:
                         if len(s) > 30:
                             all_prices[t] = s
             except Exception as e:
-                logger.warning(f"Batch {i//BATCH_SIZE} error: {e}")
+                logger.warning(f"Batch error: {e}")
             time.sleep(0.2)
-        logger.info(f"[ScannerAgent] Prix chargés: {len(all_prices)}/{len(tickers)}")
+        logger.info(f"[ScannerAgent] Prix : {len(all_prices)}/{len(tickers)}")
         return all_prices
 
     def _analyze_parallel(
-        self,
-        tickers: List[str],
-        all_prices: Dict[str, pd.Series],
-        benchmark: Optional[pd.Series],
-    ) -> List[CPAResult]:
-        """Analyse chaque titre en parallèle."""
-        results = []
+        self, tickers, all_prices, benchmark
+    ):
+        cpa_results = []
+        opportunities = []
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = {
                 executor.submit(
-                    self._analyze_ticker,
+                    self._analyze_one,
                     t,
                     all_prices.get(t, pd.Series(dtype=float)),
                     benchmark,
@@ -133,28 +117,23 @@ class ScannerAgent:
             for future in as_completed(futures):
                 ticker = futures[future]
                 try:
-                    result = future.result(timeout=30)
-                    if result:
-                        results.append(result)
+                    cpa_res, opp = future.result(timeout=60)
+                    if cpa_res:
+                        cpa_results.append(cpa_res)
+                    if opp:
+                        opportunities.append(opp)
                 except Exception as e:
-                    logger.debug(f"{ticker} analysis failed: {e}")
-        return results
+                    logger.debug(f"{ticker}: {e}")
+        return cpa_results, opportunities
 
-    def _analyze_ticker(
-        self,
-        ticker: str,
-        prices: pd.Series,
-        benchmark: Optional[pd.Series],
-    ) -> Optional[CPAResult]:
-        """Analyse un seul titre."""
+    def _analyze_one(self, ticker, prices, benchmark):
         try:
             fundamentals = fetch_fundamentals(ticker)
-            if "error" in fundamentals:
-                return None
-            if not fundamentals.get("price"):
-                return None
+            if "error" in fundamentals or not fundamentals.get("price"):
+                return None, None
 
-            result = self.calculator.compute(
+            # CPA
+            cpa_result = self.calculator.compute(
                 ticker=ticker,
                 prices=prices,
                 fundamentals=fundamentals,
@@ -162,20 +141,24 @@ class ScannerAgent:
                 benchmark_prices=benchmark,
                 universe=self.universe,
             )
-            result.sector = fundamentals.get("sector", "")
-            return result
-        except Exception as e:
-            logger.debug(f"{ticker}: {e}")
-            return None
+            cpa_result.sector = fundamentals.get("sector", "")
 
-    def _get_benchmark(self) -> Optional[pd.Series]:
-        """Retourne le benchmark selon l'univers."""
-        benchmark_map = {
-            "SP500": "SPY",
-            "NASDAQ100": "QQQ",
-            "EUROSTOXX50": "FEZ",
-        }
-        ticker = benchmark_map.get(self.universe, "SPY")
+            # ML + Opportunity (seulement si CPA confiant)
+            opp = None
+            if cpa_result.confidence >= 0.3 and len(prices) >= 200:
+                try:
+                    opp = self.detector.detect(cpa_result, prices, fundamentals)
+                except Exception as e:
+                    logger.debug(f"Opportunity detection {ticker}: {e}")
+
+            return cpa_result, opp
+        except Exception as e:
+            logger.debug(f"{ticker} fail: {e}")
+            return None, None
+
+    def _get_benchmark(self):
+        bm = {"SP500": "SPY", "NASDAQ100": "QQQ", "EUROSTOXX50": "FEZ"}
+        ticker = bm.get(self.universe, "SPY")
         try:
             prices = fetch_prices([ticker], period=DATA_PERIOD)
             if ticker in prices.columns:

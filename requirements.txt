@@ -9,3 +9,4 @@ lxml>=4.9.0
 html5lib>=1.1
 beautifulsoup4>=4.12.0
 python-telegram-bot>=20.0
+xgboost>=2.0.0
